@@ -1,140 +1,157 @@
-import pandas as pd
+"""
+Backtest runner + Walk-Forward analysis.
+"""
+from __future__ import annotations
+
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
+from typing import Dict, List
+
+import pandas as pd
+
+from backtest.engine import BacktestEngine
+from config.config import config
 from data.fetcher import DataFetcher
 from data.processor import DataProcessor
 from strategy.multi_factor import MultiFactorStrategy
-from backtest.engine import BacktestEngine
-from config.config import config
 
 logger = logging.getLogger(__name__)
 
+
 class BacktestRunner:
-    """Run backtests with different configurations"""
-    
-    def __init__(self):
-        self.fetcher = DataFetcher()
+    def __init__(self, exchange_id: str = "binanceus"):
+        self.fetcher = DataFetcher(exchange_id=exchange_id)
         self.processor = DataProcessor()
-    
+
     def run_backtest(
         self,
-        symbol: str,
-        timeframe: str = '1h',
-        days: int = 90,
-        initial_balance: float = 10000
-    ) -> dict:
-        """
-        Run a backtest for a specific symbol
-        
-        Args:
-            symbol: Trading pair (e.g., 'BTC/USDT')
-            timeframe: Candlestick period
-            days: Number of days to backtest
-            initial_balance: Starting balance
-        
-        Returns:
-            Backtest results
-        """
-        logger.info(f"Running backtest for {symbol} ({days} days)")
-        
-        # Calculate required number of candles
-        if timeframe == '1h':
-            limit = days * 24
-        elif timeframe == '4h':
-            limit = days * 6
-        elif timeframe == '1d':
-            limit = days
-        else:
-            limit = days * 24
-        
-        # Fetch data
+        symbol: str = "BTC/USDT",
+        timeframe: str = "1h",
+        limit: int = 2000,
+        initial_balance: float = 10000,
+        commission: float = 0.001,
+        slippage: float = 0.0005,
+    ) -> Dict:
+        logger.info(f"Full backtest {symbol} limit={limit}")
         df = self.fetcher.fetch_ohlcv(symbol, timeframe, limit=limit)
-        
-        # Clean data
         df = self.processor.clean_data(df)
-        
-        # Initialize strategy and engine
         strategy = MultiFactorStrategy(symbol, timeframe)
-        engine = BacktestEngine(initial_balance=initial_balance)
-        
-        # Run backtest
-        results = engine.run_backtest(df, symbol, strategy)
-        
-        return results
-    
-    def run_rolling_window_backtest(
+        engine = BacktestEngine(
+            initial_balance=initial_balance,
+            commission=commission,
+            slippage=slippage,
+            persist=True,
+        )
+        return engine.run_backtest(df, symbol, strategy)
+
+    def run_walk_forward(
         self,
-        symbol: str,
-        timeframe: str = '1h',
-        total_days: int = 365,
-        window_size: int = 90,
-        step_size: int = 30
-    ) -> list:
+        symbol: str = "BTC/USDT",
+        timeframe: str = "1h",
+        total_bars: int = 3000,
+        train_bars: int = 720,   # ~30 days of 1h
+        test_bars: int = 168,    # ~7 days
+        step_bars: int = 168,
+        initial_balance: float = 10000,
+    ) -> Dict:
         """
-        Run rolling window backtest (in-sample vs out-of-sample)
-        
-        Args:
-            symbol: Trading pair
-            timeframe: Candlestick period
-            total_days: Total historical period
-            window_size: Training window size in days
-            step_size: Step forward in days
-        
-        Returns:
-            List of backtest results for each window
+        Rolling Walk-Forward:
+        train on [i : i+train], test on [i+train : i+train+test], step forward.
         """
         logger.info(
-            f"Running rolling window backtest for {symbol} "
-            f"(total={total_days}d, window={window_size}d, step={step_size}d)"
+            f"Walk-Forward {symbol} total={total_bars} train={train_bars} "
+            f"test={test_bars} step={step_bars}"
         )
-        
-        results = []
-        
-        # Calculate required total candles
-        if timeframe == '1h':
-            total_limit = total_days * 24
-        elif timeframe == '4h':
-            total_limit = total_days * 6
-        else:
-            total_limit = total_days
-        
-        # Fetch all data
-        df_all = self.fetcher.fetch_ohlcv(symbol, timeframe, limit=total_limit)
-        df_all = self.processor.clean_data(df_all)
-        
-        # Calculate window parameters
-        if timeframe == '1h':
-            window_candles = window_size * 24
-            step_candles = step_size * 24
-        elif timeframe == '4h':
-            window_candles = window_size * 6
-            step_candles = step_size * 6
-        else:
-            window_candles = window_size
-            step_candles = step_size
-        
-        # Rolling windows
-        for start_idx in range(0, len(df_all) - window_candles, step_candles):
-            end_idx = start_idx + window_candles
-            
-            if end_idx > len(df_all):
-                break
-            
-            df_window = df_all.iloc[start_idx:end_idx]
-            
-            # Run backtest for this window
-            strategy = MultiFactorStrategy(symbol, timeframe)
-            engine = BacktestEngine(initial_balance=10000)
-            
-            window_results = engine.run_backtest(df_window, symbol, strategy)
-            window_results['start_date'] = df_window.index[0]
-            window_results['end_date'] = df_window.index[-1]
-            
-            results.append(window_results)
-            
+        df = self.fetcher.fetch_ohlcv(symbol, timeframe, limit=total_bars)
+        df = self.processor.clean_data(df)
+        if len(df) < train_bars + test_bars:
+            raise ValueError(f"Not enough data: {len(df)} < {train_bars + test_bars}")
+
+        folds = []
+        i = 0
+        while i + train_bars + test_bars <= len(df):
+            train_df = df.iloc[i : i + train_bars].copy()
+            test_df = df.iloc[i + train_bars : i + train_bars + test_bars].copy()
+
+            # In-sample (optional diagnostics)
+            strat_is = MultiFactorStrategy(symbol, timeframe)
+            eng_is = BacktestEngine(initial_balance, persist=False)
+            is_stats = eng_is.run_backtest(train_df, symbol, strat_is)
+
+            # Out-of-sample
+            strat_oos = MultiFactorStrategy(symbol, timeframe)
+            eng_oos = BacktestEngine(initial_balance, persist=False)
+            oos_stats = eng_oos.run_backtest(test_df, symbol, strat_oos)
+
+            fold = {
+                "fold": len(folds) + 1,
+                "train_start": str(train_df.index[0]),
+                "train_end": str(train_df.index[-1]),
+                "test_start": str(test_df.index[0]),
+                "test_end": str(test_df.index[-1]),
+                "is_return": is_stats.get("total_return", 0),
+                "is_sharpe": is_stats.get("sharpe_ratio", 0),
+                "is_trades": is_stats.get("total_trades", 0),
+                "oos_return": oos_stats.get("total_return", 0),
+                "oos_sharpe": oos_stats.get("sharpe_ratio", 0),
+                "oos_max_dd": oos_stats.get("max_drawdown", 0),
+                "oos_trades": oos_stats.get("total_trades", 0),
+                "oos_win_rate": oos_stats.get("win_rate", 0),
+            }
+            folds.append(fold)
             logger.info(
-                f"Window {len(results)}: {df_window.index[0]} to {df_window.index[-1]} | "
-                f"Return: {window_results.get('total_return', 0):.2f}%"
+                f"Fold {fold['fold']}: OOS return={fold['oos_return']:.2f}% "
+                f"Sharpe={fold['oos_sharpe']:.2f} DD={fold['oos_max_dd']:.2f}% trades={fold['oos_trades']}"
             )
-        
-        return results
+            i += step_bars
+
+        if not folds:
+            return {"folds": [], "summary": {}}
+
+        oos_returns = [f["oos_return"] for f in folds]
+        oos_sharpes = [f["oos_sharpe"] for f in folds]
+        summary = {
+            "n_folds": len(folds),
+            "avg_oos_return": sum(oos_returns) / len(oos_returns),
+            "avg_oos_sharpe": sum(oos_sharpes) / len(oos_sharpes),
+            "pct_positive_folds": sum(1 for r in oos_returns if r > 0) / len(oos_returns) * 100,
+            "worst_oos_return": min(oos_returns),
+            "best_oos_return": max(oos_returns),
+        }
+        logger.info(f"Walk-Forward summary: {summary}")
+        return {"folds": folds, "summary": summary}
+
+
+def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)-8s | %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    runner = BacktestRunner(exchange_id="binanceus")
+
+    print("\n========== FULL BACKTEST (BTC/USDT 1h, ~2000 bars) ==========\n")
+    stats = runner.run_backtest(symbol="BTC/USDT", timeframe="1h", limit=2000)
+    for k in ["initial_balance", "final_balance", "total_return", "total_trades",
+              "win_rate", "profit_factor", "max_drawdown", "sharpe_ratio", "total_fees"]:
+        print(f"  {k}: {stats.get(k)}")
+
+    print("\n========== WALK-FORWARD ==========\n")
+    wf = runner.run_walk_forward(
+        symbol="BTC/USDT",
+        timeframe="1h",
+        total_bars=2500,
+        train_bars=720,
+        test_bars=168,
+        step_bars=168,
+    )
+    print("Summary:", wf["summary"])
+    for f in wf["folds"]:
+        print(
+            f"  Fold {f['fold']}: OOS ret={f['oos_return']:.2f}% "
+            f"Sharpe={f['oos_sharpe']:.2f} DD={f['oos_max_dd']:.2f}% trades={f['oos_trades']}"
+        )
+
+
+if __name__ == "__main__":
+    main()

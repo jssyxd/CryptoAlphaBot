@@ -1,203 +1,201 @@
-import pandas as pd
-import numpy as np
-from datetime import datetime
+"""
+Backtest engine with realistic slippage, fees, and SQLite persistence.
+"""
+from __future__ import annotations
+
 import logging
-from typing import Dict, Tuple
-from data.fetcher import DataFetcher
+from datetime import datetime
+from typing import Dict, List
+
+import numpy as np
+import pandas as pd
+
+from config.config import config
 from data.processor import DataProcessor
-from strategy.multi_factor import MultiFactorStrategy
+from data.storage import DataStorage
 from risk.position_manager import PositionManager
 from risk.risk_control import RiskControl
-from config.config import config
+from strategy.multi_factor import MultiFactorStrategy
 
 logger = logging.getLogger(__name__)
 
+
 class BacktestEngine:
-    """Core backtesting engine for strategy validation"""
-    
     def __init__(
         self,
         initial_balance: float = None,
-        commission: float = 0.001,
-        slippage: float = 0.0005
+        commission: float = 0.001,      # 0.1% per side (Binance-like)
+        slippage: float = 0.0005,       # 0.05% slippage
+        persist: bool = True,
     ):
         self.initial_balance = initial_balance or config.INITIAL_BALANCE
         self.commission = commission
         self.slippage = slippage
-        
         self.position_manager = PositionManager(self.initial_balance)
         self.risk_control = RiskControl(self.initial_balance)
         self.data_processor = DataProcessor()
-        
-        self.trades = []
-        self.equity_curve = []
-        self.signals = []
-    
+        self.storage = DataStorage() if persist else None
+        self.trades: List[Dict] = []
+        self.equity_curve: List[Dict] = []
+
+    def _apply_slippage(self, price: float, side: str) -> float:
+        """Buy pays higher, sell receives lower."""
+        if side == "buy":
+            return price * (1 + self.slippage)
+        return price * (1 - self.slippage)
+
+    def _fee(self, notional: float) -> float:
+        return notional * self.commission
+
     def run_backtest(
         self,
         df: pd.DataFrame,
         symbol: str,
-        strategy: MultiFactorStrategy
+        strategy: MultiFactorStrategy,
     ) -> Dict:
-        """
-        Run backtest on historical data
-        
-        Args:
-            df: OHLCV DataFrame
-            symbol: Trading pair
-            strategy: Strategy instance
-        
-        Returns:
-            Backtest results dictionary
-        """
-        logger.info(f"Starting backtest for {symbol}")
-        
-        # Calculate signals
+        logger.info(f"Backtest start {symbol} | bars={len(df)} | fee={self.commission} slip={self.slippage}")
         df = strategy.calculate_signals(df)
-        
-        # Iterate through data
+
         for i in range(len(df)):
-            current_price = df['close'].iloc[i]
+            row = df.iloc[i]
+            current_price = float(row["close"])
             current_time = df.index[i]
-            current_signal = df['signal'].iloc[i]
-            dynamic_tp = df['dynamic_takeprofit'].iloc[i]
-            
-            # Check if we can trade
-            can_trade, trade_reason = self.risk_control.can_trade()
-            
-            # Process exit signals for open positions
+            current_signal = int(row["signal"])
+            dynamic_tp = float(row.get("dynamic_takeprofit", 0) or 0)
+
+            # Persist signal
+            if self.storage and current_signal != 0:
+                self.storage.save_signal(
+                    current_time, symbol, current_signal, current_price,
+                    rsi=float(row.get("rsi") or 0),
+                    dynamic_tp=dynamic_tp if dynamic_tp else None,
+                )
+
+            can_trade, reason = self.risk_control.can_trade()
+
+            # ---- Exit logic ----
             if self.position_manager.has_position(symbol):
-                position = self.position_manager.get_position(symbol)
-                pnl = self._calculate_pnl(position, current_price)
-                pnl_percent = pnl / position['entry_value'] * 100
-                
-                # Check exit conditions
+                pos = self.position_manager.get_position(symbol)
                 exit_reason = None
-                
-                # Stop loss
-                if current_price <= position['stop_loss']:
-                    exit_reason = 'stop_loss'
-                
-                # Take profit
-                elif current_price >= position['take_profit']:
-                    exit_reason = 'take_profit'
-                
-                # Sell signal
+                if current_price <= pos["stop_loss"]:
+                    exit_reason = "stop_loss"
+                elif current_price >= pos["take_profit"]:
+                    exit_reason = "take_profit"
                 elif current_signal == -1:
-                    exit_reason = 'signal'
-                
+                    exit_reason = "signal"
+
                 if exit_reason:
-                    closed_pos = self.position_manager.close_position(symbol, current_price)
-                    self.risk_control.record_trade(symbol, closed_pos['pnl'], closed_pos['pnl_percent'])
-                    
-                    self.trades.append({
-                        'entry_time': closed_pos['entry_time'],
-                        'exit_time': closed_pos['exit_time'],
-                        'entry_price': closed_pos['entry_price'],
-                        'exit_price': closed_pos['exit_price'],
-                        'pnl': closed_pos['pnl'],
-                        'pnl_percent': closed_pos['pnl_percent'],
-                        'exit_reason': exit_reason
-                    })
-            
-            # Process entry signals
+                    fill = self._apply_slippage(current_price, "sell")
+                    closed = self.position_manager.close_position(symbol, fill)
+                    if closed:
+                        notional = closed["entry_price"] * closed["position_size"]
+                        fee = self._fee(notional) + self._fee(fill * closed["position_size"])
+                        closed["pnl"] -= fee
+                        closed["pnl_percent"] = closed["pnl"] / closed["entry_value"] * 100
+                        closed["fee_total"] = fee
+                        closed["exit_reason"] = exit_reason
+                        self.risk_control.record_trade(symbol, closed["pnl"], closed["pnl_percent"])
+                        self.trades.append(closed)
+                        if self.storage:
+                            self.storage.save_trade({
+                                "symbol": symbol,
+                                "side": closed["side"],
+                                "entry_time": closed["entry_time"],
+                                "exit_time": closed["exit_time"],
+                                "entry_price": closed["entry_price"],
+                                "exit_price": closed["exit_price"],
+                                "amount": closed["position_size"],
+                                "pnl": closed["pnl"],
+                                "pnl_percent": closed["pnl_percent"],
+                                "fee_total": fee,
+                                "exit_reason": exit_reason,
+                                "stop_loss": closed.get("stop_loss"),
+                                "take_profit": closed.get("take_profit"),
+                            })
+
+            # ---- Entry logic ----
             if current_signal == 1 and not self.position_manager.has_position(symbol) and can_trade:
-                # Calculate position size
-                stop_loss_price = current_price * (1 - config.STOP_LOSS_PERCENT / 100)
-                position_size = self.position_manager.calculate_position_size(
-                    symbol,
-                    current_price,
-                    stop_loss_price
-                )
-                
-                # Calculate take profit (use dynamic TP)
-                take_profit_price = current_price * (1 + dynamic_tp / 100)
-                
-                # Open position
-                self.position_manager.open_position(
-                    symbol,
-                    'buy',
-                    current_price,
-                    stop_loss_price,
-                    take_profit_price,
-                    position_size
-                )
-            
-            # Record equity
-            portfolio_value = self.position_manager.account_balance
+                fill = self._apply_slippage(current_price, "buy")
+                stop_loss = fill * (1 - config.STOP_LOSS_PERCENT / 100)
+                tp_pct = dynamic_tp if dynamic_tp > 0 else config.BASE_TAKE_PROFIT
+                take_profit = fill * (1 + tp_pct / 100)
+                size = self.position_manager.calculate_position_size(symbol, fill, stop_loss)
+                if size > 0:
+                    fee = self._fee(fill * size)
+                    # Reduce balance by fee immediately (simpler accounting)
+                    self.position_manager.account_balance -= fee
+                    self.position_manager.open_position(
+                        symbol, "buy", fill, stop_loss, take_profit, size
+                    )
+
+            # Equity mark-to-market
+            equity = self.position_manager.account_balance
             if self.position_manager.has_position(symbol):
-                position = self.position_manager.get_position(symbol)
-                portfolio_value += position['entry_price'] * position['position_size']
-            
+                pos = self.position_manager.get_position(symbol)
+                equity += current_price * pos["position_size"]
+            self.risk_control.update_equity(equity)
             self.equity_curve.append({
-                'time': current_time,
-                'equity': portfolio_value,
-                'balance': self.position_manager.account_balance
+                "time": current_time,
+                "equity": equity,
+                "balance": self.position_manager.account_balance,
             })
-        
-        # Calculate statistics
+            if self.storage and i % 24 == 0:  # hourly snapshot approx
+                peak = max(e["equity"] for e in self.equity_curve) if self.equity_curve else equity
+                dd = (equity - peak) / peak * 100 if peak else 0
+                self.storage.save_equity(current_time, equity, self.position_manager.account_balance, dd)
+
         stats = self._calculate_statistics()
-        
-        logger.info(f"Backtest completed for {symbol}")
-        logger.info(f"Total trades: {len(self.trades)}")
-        logger.info(f"Final equity: ${self.risk_control.current_balance:.2f}")
-        
+        logger.info(
+            f"Backtest done {symbol} | trades={len(self.trades)} | "
+            f"return={stats.get('total_return', 0):.2f}% | maxDD={stats.get('max_drawdown', 0):.2f}%"
+        )
         return stats
-    
-    def _calculate_pnl(self, position: Dict, current_price: float) -> float:
-        """Calculate P&L for a position"""
-        if position['side'] == 'buy':
-            return (current_price - position['entry_price']) * position['position_size']
-        else:
-            return (position['entry_price'] - current_price) * position['position_size']
-    
+
     def _calculate_statistics(self) -> Dict:
-        """Calculate backtest statistics"""
         if not self.trades:
-            return {'error': 'No trades executed'}
-        
+            return {
+                "initial_balance": self.initial_balance,
+                "final_balance": self.risk_control.current_balance,
+                "total_return": 0.0,
+                "total_trades": 0,
+                "win_rate": 0.0,
+                "max_drawdown": 0.0,
+                "sharpe_ratio": 0.0,
+                "profit_factor": 0.0,
+                "trades": [],
+            }
+
         trades_df = pd.DataFrame(self.trades)
         equity_df = pd.DataFrame(self.equity_curve)
-        
-        total_return = (self.risk_control.current_balance - self.initial_balance) / self.initial_balance
-        annual_return = total_return * 252  # Assuming 252 trading days per year
-        
-        # Win rate
-        winning_trades = len(trades_df[trades_df['pnl'] > 0])
-        total_trades = len(trades_df)
-        win_rate = winning_trades / total_trades if total_trades > 0 else 0
-        
-        # Profit factor
-        total_profit = trades_df[trades_df['pnl'] > 0]['pnl'].sum()
-        total_loss = abs(trades_df[trades_df['pnl'] < 0]['pnl'].sum())
-        profit_factor = total_profit / total_loss if total_loss > 0 else 0
-        
-        # Max drawdown
-        equity_df['running_max'] = equity_df['equity'].expanding().max()
-        equity_df['drawdown'] = (equity_df['equity'] - equity_df['running_max']) / equity_df['running_max']
-        max_drawdown = equity_df['drawdown'].min()
-        
-        # Sharpe ratio
-        returns = equity_df['equity'].pct_change().dropna()
-        if len(returns) > 0 and returns.std() > 0:
-            sharpe = (returns.mean() / returns.std()) * np.sqrt(252)
-        else:
-            sharpe = 0
-        
+
+        total_return = (self.risk_control.current_balance - self.initial_balance) / self.initial_balance * 100
+        winning = trades_df[trades_df["pnl"] > 0]
+        losing = trades_df[trades_df["pnl"] <= 0]
+        win_rate = len(winning) / len(trades_df) * 100 if len(trades_df) else 0
+        profit_factor = (
+            winning["pnl"].sum() / abs(losing["pnl"].sum())
+            if len(losing) and losing["pnl"].sum() != 0 else 0
+        )
+
+        equity_df["running_max"] = equity_df["equity"].expanding().max()
+        equity_df["drawdown"] = (equity_df["equity"] - equity_df["running_max"]) / equity_df["running_max"]
+        max_dd = equity_df["drawdown"].min() * 100
+
+        returns = equity_df["equity"].pct_change().dropna()
+        sharpe = (returns.mean() / returns.std() * np.sqrt(252 * 24)) if len(returns) and returns.std() > 0 else 0
+
         return {
-            'initial_balance': self.initial_balance,
-            'final_balance': self.risk_control.current_balance,
-            'total_return': total_return * 100,
-            'annual_return': annual_return * 100,
-            'total_trades': total_trades,
-            'winning_trades': winning_trades,
-            'losing_trades': total_trades - winning_trades,
-            'win_rate': win_rate * 100,
-            'profit_factor': profit_factor,
-            'max_drawdown': max_drawdown * 100,
-            'sharpe_ratio': sharpe,
-            'avg_trade_profit': trades_df['pnl'].mean(),
-            'total_profit': total_profit,
-            'total_loss': -total_loss,
-            'trades': self.trades
+            "initial_balance": self.initial_balance,
+            "final_balance": self.risk_control.current_balance,
+            "total_return": total_return,
+            "total_trades": len(trades_df),
+            "winning_trades": len(winning),
+            "losing_trades": len(losing),
+            "win_rate": win_rate,
+            "profit_factor": profit_factor,
+            "max_drawdown": max_dd,
+            "sharpe_ratio": sharpe,
+            "avg_trade_pnl": trades_df["pnl"].mean(),
+            "total_fees": trades_df["fee_total"].sum() if "fee_total" in trades_df.columns else 0,
+            "trades": self.trades,
         }
