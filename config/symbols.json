@@ -1,0 +1,16 @@
+{
+  "symbols": [
+    {
+      "symbol": "BTC/USDT",
+      "enabled": true,
+      "timeframe": "1h",
+      "min_volume": 1000000
+    },
+    {
+      "symbol": "ETH/USDT",
+      "enabled": true,
+      "timeframe": "1h",
+      "min_volume": 1000000
+    }
+  ]
+}

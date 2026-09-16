@@ -1,0 +1,29 @@
+{
+  "takeprofit_params": {
+    "base": 5.0,
+    "angle_weight": 0.4,
+    "curvature_weight": 0.3,
+    "angle_scale": 100,
+    "curvature_scale": 1.0,
+    "max_takeprofit": 15.0,
+    "min_takeprofit": 4.0
+  },
+  "sma_params": {
+    "fast_period": 10,
+    "slow_period": 30
+  },
+  "rsi_params": {
+    "period": 14,
+    "overbought": 70,
+    "oversold": 30
+  },
+  "macd_params": {
+    "fast_period": 12,
+    "slow_period": 26,
+    "signal_period": 9
+  },
+  "bollinger_params": {
+    "period": 20,
+    "std_dev": 2.0
+  }
+}
